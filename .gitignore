@@ -1,3 +1,6 @@
+weights/
+reports/
+raw_vids
 mc3/
 install_mc3.sh
 project.env

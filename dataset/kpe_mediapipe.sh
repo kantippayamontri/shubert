@@ -11,12 +11,8 @@ for i in {0..255}; do
 #SBATCH --cpus-per-task=1
 #SBATCH --output=/path_to_output_logs_dir/slurm_%x.out
 
-CONDA_ROOT=
-env_name=
-
-# loading conda environment
-source \${CONDA_ROOT}/etc/profile.d/conda.sh
-conda activate \$env_name
+# loading uv virtual environment
+source /home/kan/Research/SHuBERT/.venv-feature-extraction/bin/activate
 
 # remember to download hand kpe model : wget https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker#models
 # remember to download face kpe model : wget https://ai.google.dev/edge/mediapipe/solutions/vision/face_landmarker#models

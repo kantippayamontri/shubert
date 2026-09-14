@@ -9,6 +9,7 @@ import decord
 import argparse
 import json
 import time
+import gc
 
 def load_file(filename):
     with gzip.open(filename, "rb") as f:
@@ -261,7 +262,6 @@ def video_holistic(video_file, face_path, problem_file_path, pose_path):
 
     for i in range(len(video)):
         frame = video[i].asnumpy()
-        video.seek(0)
         frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
         if result_dict[str(i)] is None: # no pose_landmarks detected
@@ -298,6 +298,7 @@ def video_holistic(video_file, face_path, problem_file_path, pose_path):
 
     out_face.release()
     del out_face
+    del video
 
 
 if __name__ == "__main__":
@@ -358,3 +359,5 @@ if __name__ == "__main__":
                 print(f"Error: {video_file}")
                 with (Path(problem_file_path)).open("a") as p:
                     p.write(video_file + "\n")
+            finally:
+                gc.collect()

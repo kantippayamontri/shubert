@@ -200,8 +200,8 @@ if __name__ == "__main__":
     time_limit = args.time_limit
     files_list = args.files_list
     problem_file_path = args.problem_file_path
-    pose_path  = args.pose_path
-    stats_path = args.stats_path
+    pose_path  = Path(args.pose_path)
+    stats_path = Path(args.stats_path)
     face_model_path = args.face_model_path
     hand_model_path = args.hand_model_path
 

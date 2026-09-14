@@ -11,16 +11,12 @@ for i in {0..255}; do
 #SBATCH --output=/path_to_output_logs_dir/slurm_%x.out
 
 
-CONDA_ROOT=
-env_name=
-
-# loading conda environment
-source \${CONDA_ROOT}/etc/profile.d/conda.sh
-conda activate \$env_name
+# loading uv virtual environment
+source /home/kan/Research/SHuBERT/.venv-shubert/bin/activate
 
 
 
-fairseq_root=SHuBERT/fairseq
+fairseq_root=/home/kan/Research/SHuBERT/fairseq
 
 
 

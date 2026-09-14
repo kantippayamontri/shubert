@@ -11,12 +11,8 @@ for i in {0..255}; do
 #SBATCH --cpus-per-task=1
 #SBATCH --output=/path_to_output_logs_dir/slurm_%x.out
 
-CONDA_ROOT=
-env_name=
-
-# loading conda environment
-source \${CONDA_ROOT}/etc/profile.d/conda.sh
-conda activate \$env_name
+# loading uv virtual environment
+source /home/kan/Research/SHuBERT/.venv-dino/bin/activate
 
 python dinov2_features.py --index "$i" \
                           --batch_size 5000 \

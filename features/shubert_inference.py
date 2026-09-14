@@ -1,140 +1,300 @@
-import torch
-import numpy as np
-import csv
-import os
-from tqdm import tqdm
-import torch
 import argparse
+import json
+import os
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import TextIO, TypeVar
+
+import numpy as np
+import torch
+
 from examples.shubert.models.shubert import SHubertModel, SHubertConfig
 
-# Function to load the model
-def load_model(checkpoint_path):
-    cfg = SHubertConfig() 
-    
-    # Initialize the model
-    model = SHubertModel(cfg)
-    
-    # Load the checkpoint
-    checkpoint = torch.load(checkpoint_path)
-    
-    # If the checkpoint is saved with a 'model' key
-    if 'model' in checkpoint:
-        state_dict = checkpoint['model']
-    else:
-        state_dict = checkpoint
-    
-    # Load the state dictionary into the model
-    model.load_state_dict(state_dict, strict=False)
-    
+
+T = TypeVar("T")
+
+
+@dataclass(frozen=True)
+class SamplePaths:
+    sample_id: str
+    face: Path
+    left_hand: Path
+    right_hand: Path
+    body: Path
+
+
+def read_manifest(path: Path) -> list[SamplePaths]:
+    samples = []
+    sample_ids = set()
+    with path.open() as f:
+        for line_num, line in enumerate(f, 1):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split('\t')
+            if len(parts) != 4:
+                raise ValueError(f"Line {line_num}: expected 4 columns, got {len(parts)}")
+            face_path = Path(parts[0])
+            if not face_path.name.endswith("_face.npy"):
+                raise ValueError(f"Line {line_num}: face path must end with _face.npy: {face_path}")
+            sample_id = face_path.name.removesuffix("_face.npy")
+            if sample_id in sample_ids:
+                raise ValueError(f"Line {line_num}: duplicate sample ID: {sample_id}")
+            sample_ids.add(sample_id)
+            samples.append(
+                SamplePaths(
+                    sample_id=sample_id,
+                    face=face_path,
+                    left_hand=Path(parts[1]),
+                    right_hand=Path(parts[2]),
+                    body=Path(parts[3]),
+                )
+            )
+    return samples
+
+
+def select_chunk(items: list[T], index: int, batch_size: int) -> list[T]:
+    if index < 0:
+        raise ValueError("index must be nonnegative")
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive")
+    start = index * batch_size
+    return items[start : start + batch_size]
+
+
+def load_validated_source(
+    sample: SamplePaths, device: torch.device
+) -> tuple[list[dict[str, torch.Tensor]], int]:
+    for name, path in [
+        ("face", sample.face),
+        ("left_hand", sample.left_hand),
+        ("right_hand", sample.right_hand),
+        ("body", sample.body),
+    ]:
+        if not path.exists():
+            raise FileNotFoundError(f"{name} not found: {path}")
+
+    face_np = np.load(sample.face, allow_pickle=False)
+    left_np = np.load(sample.left_hand, allow_pickle=False)
+    right_np = np.load(sample.right_hand, allow_pickle=False)
+    body_np = np.load(sample.body, allow_pickle=False)
+
+    expected_dims = {"face": 384, "left_hand": 384, "right_hand": 384, "body": 14}
+    arrays = {
+        "face": face_np,
+        "left_hand": left_np,
+        "right_hand": right_np,
+        "body": body_np,
+    }
+    for name, arr in arrays.items():
+        if arr.size == 0:
+            raise ValueError(f"{name} is empty")
+        if arr.ndim != 2 or arr.shape[1] != expected_dims[name]:
+            raise ValueError(f"{name} shape {arr.shape} != [T,{expected_dims[name]}]")
+        if np.issubdtype(arr.dtype, np.complexfloating):
+            raise ValueError(f"{name} dtype {arr.dtype} is not real-valued")
+        if not (
+            np.issubdtype(arr.dtype, np.integer)
+            or np.issubdtype(arr.dtype, np.floating)
+        ):
+            raise ValueError(f"{name} dtype {arr.dtype} is not numeric")
+        if not np.isfinite(arr).all():
+            raise ValueError(f"{name} contains non-finite values")
+
+    converted_arrays = {}
+    with np.errstate(over="ignore", invalid="ignore"):
+        for name, arr in arrays.items():
+            converted = np.ascontiguousarray(arr, dtype=np.float32)
+            if not np.isfinite(converted).all():
+                raise ValueError(f"{name} contains non-finite values after float32 conversion")
+            converted_arrays[name] = converted
+
+    T_face = face_np.shape[0]
+    T_left = left_np.shape[0]
+    T_right = right_np.shape[0]
+    T_body = body_np.shape[0]
+    if not (T_face == T_left == T_right == T_body):
+        raise ValueError(f"T mismatch: face={T_face}, left={T_left}, right={T_right}, body={T_body}")
+    if T_face <= 0:
+        raise ValueError("T must be positive")
+
+    face = torch.from_numpy(converted_arrays["face"]).to(device)
+    left = torch.from_numpy(converted_arrays["left_hand"]).to(device)
+    right = torch.from_numpy(converted_arrays["right_hand"]).to(device)
+    body = torch.from_numpy(converted_arrays["body"]).to(device)
+
+    length = T_face
+    source = [{
+        "face": face,
+        "left_hand": left,
+        "right_hand": right,
+        "body_posture": body,
+        "label_face": torch.zeros((length, 1), device=device),
+        "label_left_hand": torch.zeros((length, 1), device=device),
+        "label_right_hand": torch.zeros((length, 1), device=device),
+        "label_body_posture": torch.zeros((length, 1), device=device),
+    }]
+    return source, length
+
+def load_model(checkpoint_path: Path, device: torch.device) -> SHubertModel:
+    cfg = SHubertConfig()
+    model = SHubertModel.build_model(cfg, task=None)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    state_dict = checkpoint.get("model", checkpoint)
+    model.load_state_dict(state_dict, strict=True)
+    model.to(device)
     model.eval()
-    model.cuda()  # Move to GPU if available
     return model
 
 
-# Function to process a single sample
-def process_sample(model, face_path, left_hand_path, right_hand_path, body_posture_path):
-    # Load numpy arrays
-    face_np = np.load(face_path)
-    left_hand_np = np.load(left_hand_path)
-    right_hand_np = np.load(right_hand_path)
-    body_posture_np = np.load(body_posture_path)
-         
+def validate_feature_array(features: np.ndarray, expected_t: int) -> None:
+    if features.ndim != 3:
+        raise ValueError(f"ndim {features.ndim} != 3")
+    if features.shape != (12, expected_t, 768):
+        raise ValueError(f"shape {features.shape} != (12, {expected_t}, 768)")
+    if features.dtype != np.float32:
+        raise ValueError(f"dtype {features.dtype} != float32")
+    if not np.isfinite(features).all():
+        raise ValueError("non-finite values")
 
-    face = torch.from_numpy(face_np).float().cuda()
-    left_hand = torch.from_numpy(left_hand_np).float().cuda()
-    right_hand = torch.from_numpy(right_hand_np).float().cuda()
-    body_posture = torch.from_numpy(body_posture_np).float().cuda()
 
-    length = face.shape[0]
-    # Prepare input
-    source = [{
-        "face": face,
-        "left_hand": left_hand,
-        "right_hand": right_hand,
-        "body_posture": body_posture,
-        # Add dummy labels to match the expected input format
-        "label_face": torch.zeros((length, 1)).cuda(),
-        "label_left_hand": torch.zeros((length, 1)).cuda(),
-        "label_right_hand": torch.zeros((length, 1)).cuda(),
-        "label_body_posture": torch.zeros((length, 1)).cuda()
-    }]
-    
-    # Extract features
-    with torch.no_grad():
+def output_validation_error(path: Path, expected_t: int) -> str | None:
+    if not path.exists():
+        return "missing"
+    if path.stat().st_size == 0:
+        return "empty"
+    try:
+        features = np.load(path, allow_pickle=False)
+        validate_feature_array(features, expected_t)
+    except Exception as e:
+        return str(e)
+    return None
+
+
+def atomic_save(path: Path, features: np.ndarray, expected_t: int) -> None:
+    validate_feature_array(features, expected_t)
+    tmp_path = path.parent / f"{path.stem}.tmp.npy"
+    try:
+        np.save(tmp_path, features)
+        loaded = np.load(tmp_path, allow_pickle=False)
+        validate_feature_array(loaded, expected_t)
+        os.replace(tmp_path, path)
+    except Exception:
+        if tmp_path.exists():
+            tmp_path.unlink()
+        raise
+
+
+def extract_hidden_states(model, source, length: int) -> np.ndarray:
+    with torch.inference_mode():
         result = model.extract_features(source, padding_mask=None, kmeans_labels=None, mask=False)
-    
-    
-    # Extract layer outputs
-    layer_outputs = []
-    for layer in result['layer_results']:
-        # layer_output has shape [T, B, D]
-        # Since batch size B is 1, we can squeeze it
-        layer_output = layer[-1]
-        layer_output = layer_output.squeeze(1)  # Shape: [T, D]
-        # layer_output = layer_output.squeeze(0)  # Shape: [T, D]
-        layer_outputs.append(layer_output.cpu().numpy())  # Convert to NumPy array
 
-    # Stack the outputs from all layers to get an array of shape [L, T, D]
-    features = np.stack(layer_outputs, axis=0)  # Shape: [L, T, D]
+    hidden_states = []
+    for layer_result in result["layer_results"]:
+        hidden = layer_result[0]
+        hidden = hidden.squeeze(1)
+        hidden_states.append(hidden.cpu().numpy())
+
+    features = np.stack(hidden_states, axis=0).astype(np.float32, copy=False)
+    if features.shape != (12, length, 768):
+        raise ValueError(f"output shape {features.shape} != (12, {length}, 768)")
     return features
 
-# Main script
-def main(csv_list, checkpoint_path, output_dir, index):
-    model = load_model(checkpoint_path)
-    
-    os.makedirs(output_dir, exist_ok=True)
-    
-        
-    for row in csv_list:
 
-        cues_list = row[0].split('\t')
-        face_path, left_hand_path, right_hand_path, body_posture_path = cues_list[0], cues_list[1], cues_list[2], cues_list[3]
+def write_failure(report: TextIO | None, sample: SamplePaths, error: Exception) -> None:
+    if report is None:
+        return
+    failure = {
+        "sample_id": sample.sample_id,
+        "inputs": [str(sample.face), str(sample.left_hand), str(sample.right_hand), str(sample.body)],
+        "error_type": type(error).__name__,
+        "error": str(error),
+    }
+    report.write(json.dumps(failure) + "\n")
+    report.flush()
 
-        output_filename = f"{os.path.basename(face_path).rsplit('.',1)[0].rsplit('_',1)[0]}.npy"
-        output_path = os.path.join(output_dir, output_filename)
-        
-        # check if the output file already exists
-        if os.path.exists(output_path):
-            print(f"Skipping {output_path} as it already exists")
-            continue
-        
-        # Process the sample
-        features = process_sample(model, face_path, left_hand_path, right_hand_path, body_posture_path)
 
-        np.save(output_path, features)
+def main(
+    samples: list[SamplePaths],
+    checkpoint_path: Path,
+    output_dir: Path,
+    failure_report: Path | None,
+    device: torch.device,
+) -> int:
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-        
+    report = None
+    if failure_report is not None:
+        failure_report.parent.mkdir(parents=True, exist_ok=True)
+        report = failure_report.open("w")
+
+    processed = 0
+    resumed = 0
+    written = 0
+    failed = 0
+    try:
+        model = load_model(checkpoint_path, device)
+        for sample in samples:
+            processed += 1
+            output_path = output_dir / f"{sample.sample_id}.npy"
+
+            try:
+                source, length = load_validated_source(sample, device)
+                if output_validation_error(output_path, expected_t=length) is None:
+                    resumed += 1
+                else:
+                    features = extract_hidden_states(model, source, length)
+                    atomic_save(output_path, features, expected_t=length)
+                    written += 1
+            except Exception as error:
+                failed += 1
+                write_failure(report, sample, error)
+
+            if processed % 100 == 0:
+                print(f"processed={processed} resumed={resumed} written={written} failed={failed}")
+    finally:
+        if report is not None:
+            report.close()
+
+    print(f"FINAL: processed={processed} resumed={resumed} written={written} failed={failed}")
+
+    return 1 if failed > 0 else 0
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--index', type=int, required=True,
-                        help='index of the sub_list to work with')
-    parser.add_argument('--csv_path', type=str, required=True,
-                        help='path to the CSV file')
-    parser.add_argument('--checkpoint_path', type=str, required=True,
-                        help='path to the checkpoint file')
-    parser.add_argument('--output_dir', type=str, required=True,
-                        help='directory to save output files')
-    parser.add_argument('--batch_size', type=int, required=True,
-                        help='batch size for processing')
+    parser.add_argument("--csv_path", type=str, required=True, help="manifest TSV path")
+    parser.add_argument("--checkpoint_path", type=str, required=True, help="checkpoint path")
+    parser.add_argument("--output_dir", type=str, required=True, help="output directory")
+    parser.add_argument("--failure_report", type=str, default=None, help="failure report JSONL path")
+    parser.add_argument("--index", type=int, default=None, help="chunk index (requires --batch_size)")
+    parser.add_argument("--batch_size", type=int, default=None, help="chunk size (requires --index)")
     args = parser.parse_args()
-    index = args.index
-    csv_path = args.csv_path
-    checkpoint_path = args.checkpoint_path
-    output_dir = args.output_dir
-    batch_size = int(args.batch_size)
 
-    # make output dir
-    os.makedirs(output_dir, exist_ok=True)
-    
-    fixed_list = []
-    with open(csv_path, 'r') as csvfile:
-        reader = csv.reader(csvfile)
-        for row in reader:
-            fixed_list.append(row)
-    
-    
-    video_batches = [fixed_list[i:i + batch_size] for i in range(0, len(fixed_list), batch_size)]
-    
-    csv_list = video_batches[index]
-    main(csv_list, checkpoint_path, output_dir, index)
+    if (args.index is None) != (args.batch_size is None):
+        parser.error("--index and --batch_size must be used together")
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    samples = read_manifest(Path(args.csv_path))
+    failure_report = Path(args.failure_report) if args.failure_report else None
+    if failure_report is not None:
+        failure_report.parent.mkdir(parents=True, exist_ok=True)
+        failure_report.write_text("")
+
+    if args.index is not None and args.batch_size is not None:
+        try:
+            samples = select_chunk(samples, args.index, args.batch_size)
+        except ValueError as error:
+            parser.error(str(error))
+        if not samples:
+            print(f"chunk {args.index} empty, nothing to do")
+            sys.exit(0)
+
+    if not samples:
+        print("no samples to process")
+        sys.exit(0)
+
+    exit_code = main(samples, Path(args.checkpoint_path), Path(args.output_dir),
+                     failure_report, device)
+    sys.exit(exit_code)
